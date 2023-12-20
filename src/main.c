@@ -26,7 +26,6 @@ TaskHandle_t neopixel_task_handle = NULL;
 TaskHandle_t wdt_handle = NULL;
 
 QueueHandle_t output_queue = NULL;
-QueueHandle_t neopixel_queue = NULL;
 
 const uint16_t ParityBit = 0x8000u;
 const uint16_t ErrorBits = 0x2000u;
@@ -48,21 +47,21 @@ const uint16_t AgcBits = 0x6300u;
 uint32_t status_to_color(uint32_t status) {
     switch (status) {
         case STATUS_OK:
-            return urgb_u32(250, 0, 128, 64);
+            return urgb_u32(64, 64, 0);
         case STATUS_ERR_I2C:
-            return urgb_u32(0, 255, 0, 0);
+            return urgb_u32(255, 0, 0);
         case STATUS_ERR_NOMAG:
-            return urgb_u32(0, 255, 255, 0);
+            return urgb_u32(255, 255, 0);
         case STATUS_ERR_TOO_STRONG:
-            return urgb_u32(0, 0, 255, 255);
+            return urgb_u32(0, 255, 255);
         case STATUS_ERR_TOO_WEAK:
-            return urgb_u32(0, 255, 0, 255);
+            return urgb_u32(255, 0, 255);
         case STATUS_FORWARD:
-            return urgb_u32(0, 0, 128, 0);
+            return urgb_u32(0, 128, 0);
         case STATUS_BACKWARD:
-            return urgb_u32(0, 96, 0, 96);
+            return urgb_u32(96, 0, 96);
         default:
-            return urgb_u32(0, 0, 255, 0);
+            return urgb_u32(0, 255, 0);
     }
 }
 
@@ -72,12 +71,11 @@ void neopixel_task(void* unused_arg) {
 
     uint8_t counter = 0;
 
-    uint8_t led_status;
-    uint8_t last_status = STATUS_OK;
+    uint32_t led_status;
+    uint32_t last_status = STATUS_OK;
     bool is_error;
     for (;;) {
-        if (xQueueReceive(neopixel_queue, &led_status, pdMS_TO_TICKS(750))) {
-        // if (xTaskNotifyWait(0, 0xffffffffUL, &led_status, pdMS_TO_TICKS(750))) {
+        if (xTaskNotifyWait(0, 0xffffffffUL, &led_status, pdMS_TO_TICKS(750))) {
             //log_debug("got led data: %d", led_status);
             if (last_status != led_status) {
                 is_on = 0;
@@ -87,7 +85,7 @@ void neopixel_task(void* unused_arg) {
         }
         put_pixel(is_on ? 0 : status_to_color(last_status));
 
-        counter = (counter + 1) % 4;
+        counter = (counter + 1) % 3;
         if ((last_status != STATUS_FORWARD && last_status != STATUS_BACKWARD) || counter == 0) {
             is_on = !is_on;
         }
@@ -157,11 +155,7 @@ void send_word(uint16_t data) {
 }
 
 void send_led(uint8_t status) {
-    if (!xQueueSendToBack(neopixel_queue, &status, 0)) {
-        log_debug("Failed to queue neopixel");
-    }
-    // xTaskNotify seems to be blocking
-    // xTaskNotify(neopixel_task_handle, status, eSetValueWithOverwrite);
+    xTaskNotify(neopixel_task_handle, status, eSetValueWithOverwrite);
 }
 
 void report_error(uint8_t errnum) {
@@ -198,16 +192,16 @@ void as5600_position_task(void* unused_arg) {
     uint8_t direction = STATUS_FORWARD;
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        // vTaskDelay(pdMS_TO_TICKS(2000));
         send_word(VersionBits | FIRMWARE_VERSION);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // vTaskDelay(pdMS_TO_TICKS(10));
         log_debug("Initializing AS5600");
 
         if (!as5600_init()) {
             report_error(STATUS_ERR_I2C);
             log_debug("Failed to initialize AS5600");
         } else {
-            vTaskDelay(pdMS_TO_TICKS(20)); // init needs some time to settle
+            vTaskDelay(pdMS_TO_TICKS(1)); // init needs some time to settle
 
             uint8_t status = as5600_get_status();
             log_debug("Magnet status: 0x%02x", status);
@@ -219,10 +213,10 @@ void as5600_position_task(void* unused_arg) {
         }
     }
 
-    uint16_t zpos = as5600_get_zero_position();
-    uint16_t mang = as5600_get_max_angle();
-    uint16_t mpos = as5600_get_max_position();
-    log_debug("zpos = %d, max pos = %d, max angle = %d", zpos, mpos, mang);
+    log_debug("zpos = %d, max pos = %d, max angle = %d",
+        as5600_get_zero_position(),
+        as5600_get_max_position(),
+        as5600_get_max_angle());
     log_debug("Entering magnet monitor loop");
 
 	//if (!as5600_set_current_zero_position()) {
@@ -383,7 +377,6 @@ int main() {
                                         1, 
                                         &wdt_handle);
     output_queue = xQueueCreate(10, sizeof(uint16_t));
-    neopixel_queue = xQueueCreate(10, sizeof(uint8_t));
 
     log_debug("Starting rtos scheduler");
     if (pico_status == pdPASS && gpio_status == pdPASS && as5600_status == pdPASS) {

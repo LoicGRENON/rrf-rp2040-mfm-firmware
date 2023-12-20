@@ -11,24 +11,16 @@
 
 #define RegZMCO 0x00
 #define RegZPOSA 0x01
-#define RegZPOSB 0x02
 #define RegMPOSA 0x03
-#define RegMPOSB 0x04
 #define RegMANGA 0x05
-#define RegMANGB 0x06
 #define RegCONFA 0x07
-#define RegCONFB 0x08
-#define RegPUSHTHR 0x0A
 
 #define RegRAWANGLEA 0x0C
-#define RegRAWANGLEB 0x0D
 #define RegANGLEA 0x0E
-#define RegANGLEB 0x0F
 
 #define RegSTATUS 0x0B
 #define RegAGC 0x1A
 #define RegMAGNITUDEA 0x1B
-#define RegMAGNITUDEB 0x1C
 
 #define ConfFTH_Shift 10
 #define ConfFTH_18LSB (0x04 << ConfFTH_Shift)
@@ -48,8 +40,8 @@
 #define SWAP_BYTES(x) { x = (x >> 8) & 0xff | (x & 0xff) << 8; }
 
 static bool as5600_write(uint8_t reg_addr, uint8_t *buf, uint8_t len) {
-    i2c_write_timeout_us(AS5600_I2C, AS5600_ADDR, &reg_addr, 1, true, TIMEO_US);
-    return i2c_write_timeout_us(AS5600_I2C, AS5600_ADDR, buf, len, false, TIMEO_US) == len;
+    return i2c_write_timeout_us(AS5600_I2C, AS5600_ADDR, &reg_addr, 1, true, TIMEO_US) == 1 &&
+        i2c_write_timeout_us(AS5600_I2C, AS5600_ADDR, buf, len, false, TIMEO_US) == len;
 }
 static bool as5600_write16(uint8_t reg_addr, uint16_t value) {
     SWAP_BYTES(value);
@@ -60,8 +52,8 @@ static bool as5600_write8(uint8_t reg_addr, uint8_t value) {
 }
 
 static bool as5600_read(uint8_t reg_addr, uint8_t *buf, uint8_t len) {
-    i2c_write_timeout_us(AS5600_I2C, AS5600_ADDR, &reg_addr, 1, true, TIMEO_US);
-    return i2c_read_timeout_us(AS5600_I2C, AS5600_ADDR, buf, len, false, TIMEO_US) == len;
+    return i2c_write_timeout_us(AS5600_I2C, AS5600_ADDR, &reg_addr, 1, true, TIMEO_US) == 1 &&
+        i2c_read_timeout_us(AS5600_I2C, AS5600_ADDR, buf, len, false, TIMEO_US) == len;
 }
 static bool as5600_read8(uint8_t reg_addr, uint8_t *val) {
     return as5600_read(reg_addr, val, 1);
@@ -92,7 +84,30 @@ bool as5600_init() {
         prereq_init = true;
     }
     log_debug("write conf");
-    as5600_write16(RegCONFA, AS5601Config);
+    uint8_t zmco;
+    as5600_read8(RegZMCO, &zmco);
+    log_debug("zmco = %d, zpos = %d, max pos = %d, max angle = %d",
+        zmco,
+        as5600_get_zero_position(),
+        as5600_get_max_position(),
+        as5600_get_max_angle());
+
+	//if (!as5600_set_current_zero_position()) {
+    uint16_t zpos;
+    uint16_t mpos;
+    uint16_t mang;
+    as5600_read16(RegZPOSA, &zpos);
+    as5600_read16(RegMPOSA, &mpos);
+    // as5600_read16(RegMANGA, &mang);
+    mpos |= 0xfff;
+    mang |= 0xfff;
+    zpos &= 0xf000;
+    log_debug("writing zpos = 0x%04x, mpos = 0x%04x, mang = 0x%04x", zpos, mpos, mang);
+    // as5600_write16(RegMANGA, mang);
+    return
+        as5600_write16(RegZPOSA, zpos) &&
+        as5600_write16(RegMPOSA, mpos) &&
+        as5600_write16(RegCONFA, AS5601Config);
 }
 
 static void as5600_set_config() {
@@ -100,6 +115,7 @@ static void as5600_set_config() {
     as5600_read16(RegCONFA, &config);
     // mask to update only desired bit fields
     config = (config & CONFIG_MASK) | AS5601Config;
+    // config = (config & 0xfff0) | 0x0300;
     as5600_write16(RegCONFA, config);
 }
 
@@ -130,7 +146,7 @@ uint8_t as5600_get_agc() {
     return u16; \
 }
 
-MAKE_READ_REG16(get_angle, RegANGLEA)
+MAKE_READ_REG16(get_angle, RegRAWANGLEA)
 MAKE_READ_REG16(get_magnitude, RegMAGNITUDEA)
 MAKE_READ_REG16(get_zero_position, RegZPOSA)
 MAKE_READ_REG16(get_max_position, RegMPOSA)
