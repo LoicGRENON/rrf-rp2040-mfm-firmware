@@ -14,8 +14,8 @@
 #include "debug.h"
 #include "as5600.h"
 
-#define INPUT_PIN 28
-#define OUTPUT_PIN 29
+#define INPUT_PIN 29
+#define OUTPUT_PIN 28
 
 #define FIRMWARE_VERSION 4
 
