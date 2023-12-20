@@ -26,6 +26,7 @@ TaskHandle_t neopixel_task_handle = NULL;
 TaskHandle_t wdt_handle = NULL;
 
 QueueHandle_t output_queue = NULL;
+QueueHandle_t neopixel_queue = NULL;
 
 const uint16_t ParityBit = 0x8000u;
 const uint16_t ErrorBits = 0x2000u;
@@ -71,11 +72,12 @@ void neopixel_task(void* unused_arg) {
 
     uint8_t counter = 0;
 
-    uint32_t led_status;
-    uint32_t last_status = STATUS_OK;
+    uint8_t led_status;
+    uint8_t last_status = STATUS_OK;
     bool is_error;
     for (;;) {
-        if (pdTRUE == xTaskNotifyWait(0, 0xffffffffUL, &led_status, pdMS_TO_TICKS(750))) {
+        if (xQueueReceive(neopixel_queue, &led_status, pdMS_TO_TICKS(750))) {
+        // if (xTaskNotifyWait(0, 0xffffffffUL, &led_status, pdMS_TO_TICKS(750))) {
             //log_debug("got led data: %d", led_status);
             if (last_status != led_status) {
                 is_on = 0;
@@ -149,13 +151,17 @@ void _send_word(TickType_t *xNow, uint16_t data) {
 }
 
 void send_word(uint16_t data) {
-    if (pdTRUE != xQueueSendToBack(output_queue, &data, pdMS_TO_TICKS(10))) {
+    if (!xQueueSendToBack(output_queue, &data, 0)) {
         log_debug("Failed to queue send_word");
     }
 }
 
 void send_led(uint8_t status) {
-    xTaskNotify(neopixel_task_handle, status, eSetValueWithOverwrite);
+    if (!xQueueSendToBack(neopixel_queue, &status, 0)) {
+        log_debug("Failed to queue neopixel");
+    }
+    // xTaskNotify seems to be blocking
+    // xTaskNotify(neopixel_task_handle, status, eSetValueWithOverwrite);
 }
 
 void report_error(uint8_t errnum) {
@@ -213,10 +219,15 @@ void as5600_position_task(void* unused_arg) {
         }
     }
 
+    uint16_t zpos = as5600_get_zero_position();
+    uint16_t mang = as5600_get_max_angle();
+    uint16_t mpos = as5600_get_max_position();
+    log_debug("zpos = %d, max pos = %d, max angle = %d", zpos, mpos, mang);
     log_debug("Entering magnet monitor loop");
 
-	as5600_set_abn(AS500_ABN_2048_15K6HZ);
-	as5600_set_current_zero_position();
+	//if (!as5600_set_current_zero_position()) {
+    //    log_debug("could not set zero position");
+    //}
     
     TickType_t xLastWakeTime = xTaskGetTickCount();
     TickType_t xLastPositionTime;
@@ -228,27 +239,18 @@ void as5600_position_task(void* unused_arg) {
         uint8_t status = as5600_get_status();
         if (status == AS5600_MAGNET_DETECTED) {
             // drop 2 bits and take the lower 10bits for a range of 0-1024
-            // drop 3 bits, but keep a 10 bit value
-            uint16_t angle = (as5600_get_angle() >> AS5600_BITS_TO_DISCARD) & 0x3fe;
+            uint16_t angle = (as5600_get_angle() >> AS5600_BITS_TO_DISCARD) & 0x3ff;
             if (last_angle != angle) {
                 // TODO simplify
                 if (angle > last_angle) {
                     // detect wraparound
-                    if (abs(angle - last_angle) > 500) {
-                        direction = STATUS_BACKWARD;
-                    } else {
-                        direction = STATUS_FORWARD;
-                    }
+                    direction = abs(angle - last_angle) > 500 ? STATUS_BACKWARD : STATUS_FORWARD;
                 } else {
                     // detect wraparound
-                    if (abs(angle - last_angle) > 500) {
-                        direction = STATUS_FORWARD;
-                    } else {
-                        direction = STATUS_BACKWARD;
-                    }
+                    direction = abs(angle - last_angle) > 500 ? STATUS_FORWARD : STATUS_BACKWARD;
                 }
-                log_debug("Sending position %c%d/1024",
-                    direction == STATUS_FORWARD ? '+' : '-', angle);
+                log_debug("Sending position %c %d/1024",
+                    direction == STATUS_FORWARD ? '>' : '<', angle);
                 send_led(direction);
                 send_word(PositionBits | angle);
                 xLastPositionTime = xLastWakeTime;
@@ -347,11 +349,12 @@ int main() {
         true,
         &input_pin_isr);
 
-    BaseType_t pico_status = xTaskCreate(output_pin_task, 
+    BaseType_t pico_status = xTaskCreateAffinitySet(output_pin_task,
                                          "OutputPin", 
                                          1024, 
                                          NULL, 
                                          1, 
+                                         2,
                                          &output_task_handle);
     BaseType_t gpio_status = xTaskCreate(input_pin_task, 
                                          "InputPin", 
@@ -366,11 +369,12 @@ int main() {
                                            1, 
                                            1,
                                            &as5600_task_handle);
-    BaseType_t neopixel_status = xTaskCreate(neopixel_task, 
+    BaseType_t neopixel_status = xTaskCreateAffinitySet(neopixel_task,
                                              "NeopixelTask", 
                                              1024, 
                                              NULL, 
-                                             1, 
+                                             1,
+                                             2,
                                              &neopixel_task_handle);
     BaseType_t wdt_status = xTaskCreate(wdt_task, 
                                         "Watchdog", 
@@ -379,6 +383,7 @@ int main() {
                                         1, 
                                         &wdt_handle);
     output_queue = xQueueCreate(10, sizeof(uint16_t));
+    neopixel_queue = xQueueCreate(10, sizeof(uint8_t));
 
     log_debug("Starting rtos scheduler");
     if (pico_status == pdPASS && gpio_status == pdPASS && as5600_status == pdPASS) {

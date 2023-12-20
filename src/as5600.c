@@ -18,7 +18,6 @@
 #define RegMANGB 0x06
 #define RegCONFA 0x07
 #define RegCONFB 0x08
-#define RegABN 0x09
 #define RegPUSHTHR 0x0A
 
 #define RegRAWANGLEA 0x0C
@@ -40,6 +39,9 @@
 #define ConfPM_Shift 0
 #define ConfPM_NOM (0x00 << ConfPM_Shift)
 
+// bitcount: 3 FTH, 2 SF, 2 HYST, 2 PM => 9 bits to zero
+// not altering the first 2 bits (reserved?), not altering watchdog, pwmf or outs
+#define CONFIG_MASK 0b1110000011110000
 #define AS5601Config (ConfFTH_18LSB | ConfSF_2X | ConfHYST_LSB3 | ConfPM_NOM)
 #define TIMEO_US 10000
 
@@ -73,7 +75,6 @@ static bool as5600_read16(uint8_t reg_addr, uint16_t *val) {
     return false;
 }
 
-
 bool as5600_init() {
     static bool prereq_init = false;
     if (!prereq_init) {
@@ -94,20 +95,25 @@ bool as5600_init() {
     as5600_write16(RegCONFA, AS5601Config);
 }
 
+static void as5600_set_config() {
+    uint16_t config;
+    as5600_read16(RegCONFA, &config);
+    // mask to update only desired bit fields
+    config = (config & CONFIG_MASK) | AS5601Config;
+    as5600_write16(RegCONFA, config);
+}
+
 uint8_t as5600_get_status() {
     uint8_t r = 0;
     as5600_read8(RegSTATUS, &r);
     return r & (AS5600_MAGNET_TOO_WEAK | AS5600_MAGNET_TOO_STRONG | AS5600_MAGNET_DETECTED);
 }
 
-bool as5600_set_abn(uint8_t abn) {
-    return as5600_write8(RegABN, abn);
-}
-
 bool as5600_set_current_zero_position() {
     uint16_t raw_angle;
-    if (as5600_read16(RegRAWANGLEA, &raw_angle)) {
-        return as5600_write16(RegZPOSA, raw_angle);
+    uint16_t zero_pos;
+    if (as5600_read16(RegRAWANGLEA, &raw_angle) && as5600_read16(RegZPOSA, &zero_pos)) {
+        return as5600_write16(RegZPOSA, zero_pos & 0xf000 | raw_angle & 0x0fff);
     }
     return false;
 }
