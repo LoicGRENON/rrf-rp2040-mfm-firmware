@@ -33,7 +33,7 @@ target_sources(common INTERFACE
   src/as5600.c
 )
 
-target_link_libraries(common INTERFACE pico_stdlib hardware_i2c hardware_pio FreeRTOS-Kernel FreeRTOS-Kernel-Heap1)
+target_link_libraries(common INTERFACE pico_stdlib pico_bootsel_via_double_reset hardware_i2c hardware_pio FreeRTOS-Kernel FreeRTOS-Kernel-Heap4)
 
 add_executable(mfm)
 target_link_libraries(mfm common)
