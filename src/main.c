@@ -93,17 +93,24 @@ void neopixel_task(void* unused_arg) {
 }
 
 void wdt_task(void* unused_arg) {
+    uint8_t count = 0;
     for (;;) {
         watchdog_update();
         vTaskDelay(pdMS_TO_TICKS(50));
+        // tick every 5 seconds just so I can make sure my console isnt dead
+        if (++count % 100 == 0) {
+            count = 0;
+            log_debug("watchdog tick");
+        }
     }
 }
 
 void input_pin_isr(uint gpio, uint32_t events) {
-    gpio_acknowledge_irq(gpio, events);
-    BaseType_t task_woken = pdFALSE;
-    xTaskNotifyFromISR(input_task_handle, 1, eSetBits, &task_woken);
-    portYIELD_FROM_ISR(task_woken);
+    if (gpio == INPUT_PIN) {
+        BaseType_t task_woken = pdFALSE;
+        vTaskNotifyGiveFromISR(input_task_handle, &task_woken);
+        portYIELD_FROM_ISR(task_woken);
+    }
 }
 
 void _send_word(TickType_t *xNow, uint16_t data) {
@@ -284,30 +291,141 @@ void as5600_position_task(void* unused_arg) {
 }
 
 typedef enum {
-    input_unknown,
     input_start,
     input_bits,
     input_done,
-    input_none
+    input_recovery,
 } input_state;
 
-void input_pin_task(void* unused_arg) {
-    TickType_t xPrevWakeTime = 0;
-    uint16_t command_word = 0;
-    input_state state = input_unknown;
-    log_debug("input pin task");
+// TODO figure out why this isn't checking parity properly, always expects 1
+bool validate_process_input(bool parity, uint8_t value) {
+    uint8_t data8 = value & 0x7f;
+    data8 ^= (data8 >> 4);
+    data8 ^= (data8 >> 2);
+    data8 ^= (data8 >> 1);
+    if (data8 & 1 != parity)
+    {
+        log_debug("parity mismatch 0x%02x %d != %d", value, data8 & 1, parity);
+        return false;
+    } else {
+        log_debug("received input command: 0x%02x", value & 0x7f);
+        return true;
+    }
+}
 
-    while (true) {
-        uint32_t value = 0;
-        if (pdTRUE == xTaskNotifyWait(0, 0, &value, pdMS_TO_TICKS(10))) {
-            uint64_t us_time = to_us_since_boot(get_absolute_time());
-            TickType_t xWakeTime = xTaskGetTickCount();
-            bool is_high = gpio_get(INPUT_PIN);
-            command_word = (command_word << 1) | is_high;
-            xPrevWakeTime = xWakeTime;
+void input_pin_task(void* unused_arg) {
+    input_state state = input_done;
+    log_debug("input pin task");
+    absolute_time_t last_time = get_absolute_time();
+    uint8_t bit_count = 0;
+    bool parity_value;
+    bool need_stuffing_check;
+    bool stuffing_bit_passed;
+    uint8_t value = 0;
+
+    for (;;) {
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100))) {
+            absolute_time_t now = get_absolute_time();
+            uint64_t diff_us = absolute_time_diff_us(last_time, now);
+            bool is_high = !gpio_get(INPUT_PIN);
+            // actually, we're counting *was* high
+            // how many bits does this interval represent?
+            uint64_t bits = diff_us / 10000 + (diff_us % 10000 > 5000 ? 1 : 0);
+            // something is wrong with this log_debug... some imaginary 0 value is pulled in for 3rd
+            log_debug("state %d, count %d, ignore %d, bit %d", state, bits, is_high ? 1 : 0, diff_us);
+            switch (state) {
+                case input_start:
+                  if (!is_high && bits > 0) {
+                    log_debug("start bit low");
+                    state = input_bits;
+                    value = 0;
+                    bits--;
+                  } else {
+                    log_debug("wrong start state %d %d %dus", is_high, bits, diff_us);
+                    bits = 0;
+                    state = input_recovery;
+                  }
+                  if (bits == 0) {
+                    break;
+                  }
+                case input_bits: if (bits > 0) {
+                  if (bits < 1 || bits > 5) {
+                    log_debug("Bit interval wrong %dus", diff_us);
+                    state = input_recovery;
+                    break;
+                  }
+                  if (bit_count == 0) {
+                    parity_value = is_high;
+                    log_debug("parity bit %d", parity_value);
+                    value = value << 1 | parity_value;
+                    bit_count++;
+                    bits--;
+                  }
+                  for (;bits > 0 && bit_count <= 8; bits--) {
+                    if (bit_count == 1 || bit_count == 5) {
+                        need_stuffing_check = true;
+                    }
+                    if (bit_count > 0 && bit_count % 4 == 0 && need_stuffing_check) {
+                        need_stuffing_check = false;
+                        if (value & 1 == is_high) {
+                            log_debug("stuffing bit mismatch %d == %d", value & 1, is_high);
+                            state = input_recovery;
+                        } else if (bit_count == 8) {
+                            stuffing_bit_passed = true;
+                        }
+                    } else {
+                        value = value << 1 | is_high;
+                        bit_count++;
+                        log_debug("saving regular value: %d 0x%x", bit_count, value);
+                    }
+                  }
+                  if (bit_count > 8) {
+                    log_debug("Too many bits found: %d", bit_count);
+                    state = input_recovery;
+                  }
+                  if (bit_count == 8 && stuffing_bit_passed) {
+                    validate_process_input(parity_value, value);
+                    bit_count = 0;
+                    state = input_done;
+                  }
+                }
+                  break;
+                case input_recovery:
+                  // do nothing until we time out
+                  log_debug("Waiting for recovery from bad bits: %d", is_high);
+                  break;
+                case input_done:
+                  if (is_high) {
+                    if (diff_us > 7000 && diff_us < 13000) {
+                        log_debug("start bit high");
+                        state = input_start;
+                    } else {
+                        log_debug("start high pulse wrong duration %dus", diff_us);
+                        state = input_recovery;
+                    }
+                  }
+                  break;
+            }
+            last_time = now;
         } else {
-            xPrevWakeTime = xTaskGetTickCount();
-            state = input_none;
+            if (bit_count == 8 && stuffing_bit_passed) {
+                validate_process_input(parity_value, value);
+            } else if (bit_count == 8 && need_stuffing_check) {
+
+                // logic slightly inverted because we're checking after the edge transition
+                bool is_high = !gpio_get(INPUT_PIN);
+                if (value & 1 == gpio_get(INPUT_PIN)) {
+                    log_debug("stuffing bit mismatch %d == %d", value & 1, is_high);
+                    state = input_recovery;
+                } else {
+                    validate_process_input(parity_value, value);
+                }
+            } else if (bit_count > 0) {
+                log_debug("discarding incomplete value 0x%02x bits %d", value, bit_count);
+            }
+            bit_count = 0;
+            stuffing_bit_passed = false;
+            state = input_done;
         }
     }
 }

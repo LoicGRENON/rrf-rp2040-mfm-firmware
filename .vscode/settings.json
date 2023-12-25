@@ -27,6 +27,7 @@
     "i2c.h": "c",
     "gpio.h": "c",
     "stdio.h": "c",
-    "time.h": "c"
+    "time.h": "c",
+    "multicore.h": "c"
   }
 }

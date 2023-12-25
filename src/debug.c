@@ -15,9 +15,8 @@ void _log_debug(const char* fmt, const char* file, uint32_t line, ...) {
     char *sprintf_buffer = get_core_num() == 0 ? core_buffer1 : core_buffer2;
     va_list argp;
     va_start(argp, line);
-    uint msg_length = 9 + strlen(fmt);
     TickType_t now = xTaskGetTickCount();
-    sprintf(sprintf_buffer, "[DEBUG] %d %d.%03d %s:%d %s\n",
+    snprintf(sprintf_buffer, 1024, "[DEBUG] %d %d.%03d %s:%d %s\n",
         get_core_num(),
         now / 1000, now % 1000,
         file, line, fmt);
