@@ -279,10 +279,12 @@ void as5600_position_task(void* unused_arg) {
                 log_debug("sensor in a bad status, send status %d", status);
                 report_error(status_to_err(status));
             }
-            log_debug("Sending status");
+            uint8_t agc = as5600_get_agc();
+            uint16_t mag = as5600_get_magnitude() >> 4;
+            log_debug("Sending status mag %d agc %d", mag, agc);
             send_word(VersionBits | FIRMWARE_VERSION);
-            send_word(AgcBits | as5600_get_agc());
-            send_word(MagnitudeBits | ((as5600_get_magnitude() >> 4) & 0x00ff));
+            send_word(AgcBits | agc);
+            send_word(MagnitudeBits | (mag & 0x00ff));
 
             send_status = false;
             xLastStatusTime = xLastWakeTime;
@@ -303,12 +305,12 @@ bool validate_process_input(bool parity, uint8_t value) {
     data8 ^= (data8 >> 4);
     data8 ^= (data8 >> 2);
     data8 ^= (data8 >> 1);
-    if (data8 & 1 != parity)
+    if ((data8 & 1) != parity)
     {
         log_debug("parity mismatch 0x%02x %d != %d", value, data8 & 1, parity);
         return false;
     } else {
-        log_debug("received input command: 0x%02x", value & 0x7f);
+        log_debug("received input command: 0x%02x data8=0x%02x parity=%d", value & 0x7f, data8, parity);
         return true;
     }
 }
