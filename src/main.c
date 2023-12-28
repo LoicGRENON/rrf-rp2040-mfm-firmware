@@ -41,8 +41,72 @@ const uint16_t AgcBits = 0x6300u;
 #define STATUS_ERR_TOO_STRONG 8
 #define STATUS_FORWARD 9
 #define STATUS_BACKWARD 10
+#define STATUS_PULSE_ON 11
+#define STATUS_PULSE_OFF 12
+
+// uint8_t mode format PMMMIKKK:
+//   1 bit parity, 3 bits to select mode, I invert bit, 3 bits pulse mask
+//     0-7=(10 bits total, selectable 2-9 bit mask for values of 0-7)
+//     I bit inverts pulse direction output on pulse mode: 1 = invert, 0 = as-is
+#define MODE_MFM 0x10 // default is mfm
+#define MODE_PULSE 0x20 // will be pulse until rebooted, or set back to mfm
+// 24mm rotation,
+// 9 bit mask = on for half rotation, off for half rotation, 1 pulse per rotation
+// 8 = on for 1/4 rotation
+// 7 = on for 1/8 rotation
+// 6 = on for 1/16
+// 5 = on for 1/32
+// 4 = on for 1/64
+// 3 = on for 1/128
+// 2 = on for 1/256
+uint8_t pulse_mask = 0;
+bool pulse_dir_invert = 0;
+uint8_t sensor_mode = MODE_MFM;
+bool suppress_output = false;
 
 #define AS5600_BITS_TO_DISCARD 2
+
+void input_pin_isr(uint, uint32_t);
+void enable_irq(bool enable) {
+    gpio_set_irq_enabled_with_callback(
+        INPUT_PIN,
+        GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE,
+        enable,
+        &input_pin_isr);
+}
+
+void set_sensor_mode(uint8_t mode) {
+    uint8_t new_mode;
+    suppress_output = true;
+    if ((mode & MODE_PULSE) == MODE_PULSE) {
+        pulse_mask = 2 + (mode & 0x07);
+        pulse_dir_invert = mode & 0x04;
+        sensor_mode = MODE_PULSE;
+        log_debug("Setting sensor to pulse mode with %d bit mask", pulse_mask);
+    } else {
+        log_debug("Setting sensor to mfm mode");
+        // delay setting mode to mfm so the position task does not interfere
+        sensor_mode = MODE_MFM;
+    }
+    // allow the printer firmware to confirm the mode switch is successful, query the pin
+    // states over a period of time to ascertain success
+    enable_irq(false);
+    gpio_pull_down(INPUT_PIN);
+    gpio_put(OUTPUT_PIN, true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_pull_up(INPUT_PIN);
+    gpio_put(OUTPUT_PIN, false);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_pull_down(INPUT_PIN);
+    gpio_put(OUTPUT_PIN, true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    gpio_put(OUTPUT_PIN, false);
+
+    // reset any pullup/down from pulse counting
+    gpio_pull_down(INPUT_PIN);
+    enable_irq(true);
+    suppress_output = false;
+}
 
 uint32_t status_to_color(uint32_t status) {
     switch (status) {
@@ -76,6 +140,11 @@ void neopixel_task(void* unused_arg) {
     bool is_error;
     for (;;) {
         if (xTaskNotifyWait(0, 0xffffffffUL, &led_status, pdMS_TO_TICKS(750))) {
+            if (led_status == STATUS_PULSE_ON) {
+                put_pixel(urgb_u32(64, 64, 64));
+            } else if (led_status == STATUS_PULSE_OFF) {
+                put_pixel(0);
+            }
             //log_debug("got led data: %d", led_status);
             if (last_status != led_status) {
                 is_on = 0;
@@ -83,11 +152,13 @@ void neopixel_task(void* unused_arg) {
             }
             last_status = led_status;
         }
-        put_pixel(is_on ? 0 : status_to_color(last_status));
+        if (led_status != STATUS_PULSE_ON && led_status != STATUS_PULSE_OFF) {
+            put_pixel(is_on ? 0 : status_to_color(last_status));
 
-        counter = (counter + 1) % 3;
-        if ((last_status != STATUS_FORWARD && last_status != STATUS_BACKWARD) || counter == 0) {
-            is_on = !is_on;
+            counter = (counter + 1) % 3;
+            if ((last_status != STATUS_FORWARD && last_status != STATUS_BACKWARD) || counter == 0) {
+                is_on = !is_on;
+            }
         }
     }
 }
@@ -174,12 +245,17 @@ void report_error(uint8_t errnum) {
 void output_pin_task(void* unused_arg) {
     uint16_t output_word;
     while (true) {
-        if (xQueueReceive(output_queue, &output_word, pdMS_TO_TICKS(500))) {
-            //log_debug("sending output 0x%04x", output_word);
-            TickType_t xNow = xTaskGetTickCount();
-            _send_word(&xNow, output_word);
-            // give the receiver some time to recover after sending a word
-            vTaskDelay(pdMS_TO_TICKS(10));
+        if (xQueueReceive(output_queue, &output_word, pdMS_TO_TICKS(500)) && !suppress_output) {
+            if (sensor_mode == MODE_MFM) {
+                //log_debug("sending output 0x%04x", output_word);
+                TickType_t xNow = xTaskGetTickCount();
+                _send_word(&xNow, output_word);
+                // give the receiver some time to recover after sending a word
+                vTaskDelay(pdMS_TO_TICKS(10));
+            } else {
+                // pulse mode just set on or off
+                gpio_put(OUTPUT_PIN, output_word);
+            }
         }
     }
 }
@@ -194,14 +270,24 @@ uint8_t status_to_err(uint8_t status) {
                 : STATUS_OK;
 }
 
+uint8_t pulse_direction(uint16_t last_angle, uint16_t angle) {
+    // TODO simplify
+    if (angle > last_angle) {
+        // detect wraparound
+        return abs(angle - last_angle) > 500 ? STATUS_BACKWARD : STATUS_FORWARD;
+    } else {
+        // detect wraparound
+        return abs(angle - last_angle) > 500 ? STATUS_FORWARD : STATUS_BACKWARD;
+    }
+
+}
+
 void as5600_position_task(void* unused_arg) {
     uint16_t last_angle = 0;
     uint8_t direction = STATUS_FORWARD;
 
     for (;;) {
-        // vTaskDelay(pdMS_TO_TICKS(2000));
         send_word(VersionBits | FIRMWARE_VERSION);
-        // vTaskDelay(pdMS_TO_TICKS(10));
         log_debug("Initializing AS5600");
 
         if (!as5600_init()) {
@@ -226,10 +312,6 @@ void as5600_position_task(void* unused_arg) {
         as5600_get_max_angle());
     log_debug("Entering magnet monitor loop");
 
-	//if (!as5600_set_current_zero_position()) {
-    //    log_debug("could not set zero position");
-    //}
-    
     TickType_t xLastWakeTime = xTaskGetTickCount();
     TickType_t xLastPositionTime;
     TickType_t xLastStatusTime;
@@ -239,33 +321,49 @@ void as5600_position_task(void* unused_arg) {
         xTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(40));
         uint8_t status = as5600_get_status();
         if (status == AS5600_MAGNET_DETECTED) {
-            // drop 2 bits and take the lower 10bits for a range of 0-1024
             uint16_t angle = (as5600_get_angle() >> AS5600_BITS_TO_DISCARD) & 0x3ff;
-            if (last_angle != angle) {
-                // TODO simplify
-                if (angle > last_angle) {
-                    // detect wraparound
-                    direction = abs(angle - last_angle) > 500 ? STATUS_BACKWARD : STATUS_FORWARD;
-                } else {
-                    // detect wraparound
-                    direction = abs(angle - last_angle) > 500 ? STATUS_FORWARD : STATUS_BACKWARD;
+            if (sensor_mode == MODE_MFM) {
+                // drop 2 bits and take the lower 10bits for a range of 0-1024
+                if (last_angle != angle) {
+                    direction = pulse_direction(last_angle, angle);
+                    log_debug("Sending position %c %d/1024",
+                        direction == STATUS_FORWARD ? '>' : '<', angle);
+                    send_led(direction);
+                    send_word(PositionBits | angle);
+                    xLastPositionTime = xLastWakeTime;
+                } else if (!status_good || (pdMS_TO_TICKS(500) <= (xLastWakeTime - xLastPositionTime))) {
+                    if (!status_good) {
+                        log_debug("status has fixed, send immediate update");
+                    }
+                    log_debug("No position update sending %d/1024", last_angle);
+                    send_led(status_to_err(status));
+                    send_word(PositionBits | last_angle);
+                    xLastPositionTime = xLastWakeTime;
                 }
-                log_debug("Sending position %c %d/1024",
-                    direction == STATUS_FORWARD ? '>' : '<', angle);
-                send_led(direction);
-                send_word(PositionBits | angle);
-                xLastPositionTime = xLastWakeTime;
-            } else if (!status_good || (pdMS_TO_TICKS(500) <= (xLastWakeTime - xLastPositionTime))) {
-                if (!status_good) {
-                    log_debug("status has fixed, send immediate update");
+                status_good = true;
+            } else if (!suppress_output) {
+                bool last_pulse = (last_angle >> pulse_mask) & 1;
+                bool pulse_on = (angle >> pulse_mask) & 1;
+                if (last_pulse != pulse_on) {
+                    direction = pulse_direction(last_angle, angle);
+                    enable_irq(false);
+                    bool up_or_down = direction == STATUS_FORWARD;
+                    if (pulse_dir_invert) {
+                        up_or_down = !up_or_down;
+                    }
+
+                    if (up_or_down) {
+                        gpio_pull_up(INPUT_PIN);
+                    } else {
+                        gpio_pull_down(INPUT_PIN);
+                    }
+                    enable_irq(true);
+                    log_debug("Sending pulse state %s", pulse_on ? "on" : "off");
                 }
-                log_debug("No position update sending %d/1024", last_angle);
-                send_led(status_to_err(status));
-                send_word(PositionBits | last_angle);
-                xLastPositionTime = xLastWakeTime;
+                send_led(pulse_on ? STATUS_PULSE_ON : STATUS_PULSE_OFF);
+                gpio_put(OUTPUT_PIN, pulse_on);
             }
             last_angle = angle;
-            status_good = true;
         } else {
             if (status_good) {
                 // send status immediately when the as5600 state goes bad
@@ -274,7 +372,7 @@ void as5600_position_task(void* unused_arg) {
             status_good = false;
         }
 
-        if (send_status || pdMS_TO_TICKS(500) <= xLastWakeTime - xLastStatusTime) {
+        if (sensor_mode == MODE_MFM && (send_status || pdMS_TO_TICKS(500) <= xLastWakeTime - xLastStatusTime)) {
             if (!status_good) {
                 log_debug("sensor in a bad status, send status %d", status);
                 report_error(status_to_err(status));
@@ -299,8 +397,7 @@ typedef enum {
     input_recovery,
 } input_state;
 
-// TODO figure out why this isn't checking parity properly, always expects 1
-bool validate_process_input(bool parity, uint8_t value) {
+void validate_process_input(bool parity, uint8_t value) {
     uint8_t data8 = value & 0x7f;
     data8 ^= (data8 >> 4);
     data8 ^= (data8 >> 2);
@@ -308,10 +405,9 @@ bool validate_process_input(bool parity, uint8_t value) {
     if ((data8 & 1) != parity)
     {
         log_debug("parity mismatch 0x%02x %d != %d", value, data8 & 1, parity);
-        return false;
     } else {
         log_debug("received input command: 0x%02x data8=0x%02x parity=%d", value & 0x7f, data8, parity);
-        return true;
+        set_sensor_mode(value & 0x7f);
     }
 }
 
@@ -326,7 +422,7 @@ void input_pin_task(void* unused_arg) {
     uint8_t value = 0;
 
     for (;;) {
-        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100))) {
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)) && !suppress_output) {
             absolute_time_t now = get_absolute_time();
             uint64_t diff_us = absolute_time_diff_us(last_time, now);
             bool is_high = !gpio_get(INPUT_PIN);
@@ -457,11 +553,7 @@ int main() {
     gpio_init(INPUT_PIN);
     gpio_pull_down(INPUT_PIN);
     gpio_set_dir(INPUT_PIN, GPIO_IN);
-    gpio_set_irq_enabled_with_callback(
-        INPUT_PIN,
-        GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE,
-        true,
-        &input_pin_isr);
+    enable_irq(true);
 
     BaseType_t pico_status = xTaskCreateAffinitySet(output_pin_task,
                                          "OutputPin", 
