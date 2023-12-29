@@ -482,6 +482,7 @@ void input_pin_task(void* unused_arg) {
                     state = input_recovery;
                   }
                   if (bit_count == 8 && stuffing_bit_passed) {
+                    log_debug("processing in input_bits");
                     validate_process_input(parity_value, value);
                     bit_count = 0;
                     state = input_done;
@@ -507,6 +508,7 @@ void input_pin_task(void* unused_arg) {
             last_time = now;
         } else {
             if (bit_count == 8 && stuffing_bit_passed) {
+                log_debug("processing in timeout");
                 validate_process_input(parity_value, value);
             } else if (bit_count == 8 && need_stuffing_check) {
 
@@ -516,6 +518,7 @@ void input_pin_task(void* unused_arg) {
                     log_debug("stuffing bit mismatch %d == %d", value & 1, is_high);
                     state = input_recovery;
                 } else {
+                    log_debug("processing in timeout with stuffing check");
                     validate_process_input(parity_value, value);
                 }
             } else if (bit_count > 0) {
@@ -556,37 +559,37 @@ int main() {
     enable_irq(true);
 
     BaseType_t pico_status = xTaskCreateAffinitySet(output_pin_task,
-                                         "OutputPin", 
-                                         1024, 
-                                         NULL, 
-                                         1, 
+                                         "OutputPin",
+                                         1024,
+                                         NULL,
+                                         1,
                                          2,
                                          &output_task_handle);
-    BaseType_t gpio_status = xTaskCreate(input_pin_task, 
-                                         "InputPin", 
-                                         1024, 
-                                         NULL, 
-                                         1, 
+    BaseType_t gpio_status = xTaskCreate(input_pin_task,
+                                         "InputPin",
+                                         1024,
+                                         NULL,
+                                         1,
                                          &input_task_handle);
-    BaseType_t as5600_status = xTaskCreateAffinitySet(as5600_position_task, 
-                                           "AS5600Position", 
-                                           1024, 
-                                           NULL, 
-                                           1, 
+    BaseType_t as5600_status = xTaskCreateAffinitySet(as5600_position_task,
+                                           "AS5600Position",
+                                           1024,
+                                           NULL,
+                                           1,
                                            1,
                                            &as5600_task_handle);
     BaseType_t neopixel_status = xTaskCreateAffinitySet(neopixel_task,
-                                             "NeopixelTask", 
-                                             1024, 
-                                             NULL, 
+                                             "NeopixelTask",
+                                             1024,
+                                             NULL,
                                              1,
                                              2,
                                              &neopixel_task_handle);
-    BaseType_t wdt_status = xTaskCreate(wdt_task, 
-                                        "Watchdog", 
-                                        128, 
-                                        NULL, 
-                                        1, 
+    BaseType_t wdt_status = xTaskCreate(wdt_task,
+                                        "Watchdog",
+                                        128,
+                                        NULL,
+                                        1,
                                         &wdt_handle);
     output_queue = xQueueCreate(10, sizeof(uint16_t));
 
